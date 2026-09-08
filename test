@@ -1,0 +1,420 @@
+#!/bin/bash
+#
+# list_timebound_groups.sh
+#
+# Generates:
+#   1. CSV report
+#   2. HTML report
+#   3. Sends HTML report using Amazon SES
+#
+
+set -euo pipefail
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+FILTER_KEYWORD="timebound"
+
+# SES configuration
+SES_REGION="us-east-1"
+
+FROM_EMAIL="aws-reports@yourcompany.com"
+TO_EMAILS="user1@yourcompany.com,user2@yourcompany.com"
+
+SEND_EMAIL="true"
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+OUTPUT_CSV="timebound_groups_${TIMESTAMP}.csv"
+OUTPUT_HTML="timebound_groups_${TIMESTAMP}.html"
+SES_JSON="ses_message_${TIMESTAMP}.json"
+
+SUBJECT="AWS Timebound Access Report - $(date '+%Y-%m-%d')"
+
+
+# ============================================================
+# FUNCTION TO HTML-ESCAPE TEXT
+# ============================================================
+
+html_escape()
+{
+    printf '%s' "$1" | jq -Rr '@html'
+}
+
+
+# ============================================================
+# GET IDENTITY CENTER INSTANCE
+# ============================================================
+
+echo "Fetching IAM Identity Center instance..."
+
+IDENTITY_STORE_ID=$(aws sso-admin list-instances \
+    --query 'Instances[0].IdentityStoreId' \
+    --output text)
+
+if [[ -z "$IDENTITY_STORE_ID" || "$IDENTITY_STORE_ID" == "None" ]]; then
+    echo "ERROR: No IAM Identity Center instance found."
+    exit 1
+fi
+
+echo "Identity Store ID: $IDENTITY_STORE_ID"
+echo "Filtering groups containing keyword: '$FILTER_KEYWORD'"
+echo ""
+
+
+# ============================================================
+# GET GROUPS
+# ============================================================
+
+ALL_GROUPS_JSON=$(aws identitystore list-groups \
+    --identity-store-id "$IDENTITY_STORE_ID" \
+    --output json)
+
+MATCHED_GROUPS=$(echo "$ALL_GROUPS_JSON" | jq -r \
+    --arg kw "$FILTER_KEYWORD" \
+    '.Groups[]
+     | select(.DisplayName | ascii_downcase | contains($kw | ascii_downcase))
+     | "\(.GroupId)|\(.DisplayName)"' \
+    | sort -t'|' -k2)
+
+if [[ -z "$MATCHED_GROUPS" ]]; then
+    echo "No groups found containing '$FILTER_KEYWORD'."
+    exit 0
+fi
+
+MATCH_COUNT=$(echo "$MATCHED_GROUPS" | wc -l | tr -d ' ')
+
+echo "Found $MATCH_COUNT timebound group(s)."
+
+
+# ============================================================
+# CREATE CSV
+# ============================================================
+
+echo "GroupName,Member Count,Members" > "$OUTPUT_CSV"
+
+
+# ============================================================
+# CREATE HTML HEADER
+# ============================================================
+
+cat > "$OUTPUT_HTML" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+
+<style>
+
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 14px;
+    color: #333333;
+    margin: 25px;
+}
+
+h2 {
+    color: #232f3e;
+}
+
+.summary {
+    background-color: #f3f4f6;
+    padding: 12px;
+    margin-bottom: 20px;
+    border-left: 5px solid #ff9900;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th {
+    background-color: #232f3e;
+    color: white;
+    text-align: left;
+    padding: 10px;
+}
+
+td {
+    border: 1px solid #dddddd;
+    padding: 10px;
+    vertical-align: top;
+}
+
+tr:nth-child(even) {
+    background-color: #f7f7f7;
+}
+
+.member-count {
+    text-align: center;
+    font-weight: bold;
+}
+
+ul {
+    margin: 0;
+    padding-left: 20px;
+}
+
+.footer {
+    margin-top: 20px;
+    font-size: 12px;
+    color: #777777;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h2>AWS IAM Identity Center - Timebound Access Report</h2>
+
+<div class="summary">
+
+<b>Report generated:</b> $REPORT_DATE
+<br>
+
+<b>Filter:</b> $FILTER_KEYWORD
+<br>
+
+<b>Total timebound groups:</b> $MATCH_COUNT
+
+</div>
+
+<table>
+
+<tr>
+<th>Timebound Group</th>
+<th>Member Count</th>
+<th>Members</th>
+</tr>
+
+EOF
+
+
+# ============================================================
+# PROCESS EACH GROUP
+# ============================================================
+
+TOTAL_USERS=0
+
+while IFS='|' read -r GROUP_ID GROUP_NAME
+do
+
+    echo "Processing: $GROUP_NAME"
+
+    MEMBER_IDS=$(aws identitystore list-group-memberships \
+        --identity-store-id "$IDENTITY_STORE_ID" \
+        --group-id "$GROUP_ID" \
+        --query 'GroupMemberships[].MemberId.UserId' \
+        --output text)
+
+    MEMBERS_STR=""
+    MEMBERS_HTML=""
+    MEMBER_COUNT=0
+
+    if [[ -n "$MEMBER_IDS" ]]; then
+
+        MEMBERS_HTML="<ul>"
+
+        for USER_ID in $MEMBER_IDS
+        do
+
+            USER_INFO=$(aws identitystore describe-user \
+                --identity-store-id "$IDENTITY_STORE_ID" \
+                --user-id "$USER_ID" \
+                --query \
+                '{DisplayName:DisplayName,
+                  Email:Emails[0].Value,
+                  UserName:UserName}' \
+                --output json)
+
+            DISPLAY_NAME=$(echo "$USER_INFO" | jq -r '.DisplayName // ""')
+            EMAIL=$(echo "$USER_INFO" | jq -r '.Email // ""')
+            USER_NAME=$(echo "$USER_INFO" | jq -r '.UserName // ""')
+
+            # Fallbacks
+
+            [[ -z "$DISPLAY_NAME" ]] && DISPLAY_NAME="$USER_NAME"
+            [[ -z "$EMAIL" ]] && EMAIL="$USER_NAME"
+
+            ENTRY="${DISPLAY_NAME} <${EMAIL}>"
+
+            # CSV member list
+
+            if [[ -z "$MEMBERS_STR" ]]; then
+                MEMBERS_STR="$ENTRY"
+            else
+                MEMBERS_STR="${MEMBERS_STR}; ${ENTRY}"
+            fi
+
+            # HTML member list
+
+            DISPLAY_NAME_HTML=$(html_escape "$DISPLAY_NAME")
+            EMAIL_HTML=$(html_escape "$EMAIL")
+
+            MEMBERS_HTML="${MEMBERS_HTML}<li>${DISPLAY_NAME_HTML} &lt;${EMAIL_HTML}&gt;</li>"
+
+            MEMBER_COUNT=$((MEMBER_COUNT + 1))
+            TOTAL_USERS=$((TOTAL_USERS + 1))
+
+        done
+
+        MEMBERS_HTML="${MEMBERS_HTML}</ul>"
+
+    else
+
+        MEMBERS_STR="(No members)"
+        MEMBERS_HTML="<i>No members</i>"
+
+    fi
+
+
+    # ========================================================
+    # WRITE CSV
+    # ========================================================
+
+    MEMBERS_STR_ESC="${MEMBERS_STR//\"/\"\"}"
+
+    echo "\"${GROUP_NAME}\",${MEMBER_COUNT},\"${MEMBERS_STR_ESC}\"" \
+        >> "$OUTPUT_CSV"
+
+
+    # ========================================================
+    # WRITE HTML ROW
+    # ========================================================
+
+    GROUP_NAME_HTML=$(html_escape "$GROUP_NAME")
+
+    cat >> "$OUTPUT_HTML" <<EOF
+
+<tr>
+
+<td>
+<b>${GROUP_NAME_HTML}</b>
+</td>
+
+<td class="member-count">
+${MEMBER_COUNT}
+</td>
+
+<td>
+${MEMBERS_HTML}
+</td>
+
+</tr>
+
+EOF
+
+done <<< "$MATCHED_GROUPS"
+
+
+# ============================================================
+# CLOSE HTML
+# ============================================================
+
+cat >> "$OUTPUT_HTML" <<EOF
+
+</table>
+
+<div class="footer">
+
+Total groups: $MATCH_COUNT
+<br>
+
+Total group memberships: $TOTAL_USERS
+<br><br>
+
+Generated automatically from AWS IAM Identity Center.
+
+</div>
+
+</body>
+</html>
+
+EOF
+
+
+# ============================================================
+# OUTPUT STATUS
+# ============================================================
+
+echo ""
+echo "-------------------------------------------------------------"
+echo "Report generation completed."
+echo ""
+echo "CSV : $OUTPUT_CSV"
+echo "HTML: $OUTPUT_HTML"
+echo ""
+echo "Groups processed : $MATCH_COUNT"
+echo "Memberships      : $TOTAL_USERS"
+echo "-------------------------------------------------------------"
+
+
+# ============================================================
+# SEND EMAIL USING AMAZON SES
+# ============================================================
+
+if [[ "$SEND_EMAIL" == "true" ]]; then
+
+    echo ""
+    echo "Preparing email..."
+
+    # Convert comma-separated recipients into JSON array
+
+    TO_JSON=$(echo "$TO_EMAILS" | jq -Rc 'split(",")')
+
+    jq -n \
+        --arg from "$FROM_EMAIL" \
+        --argjson recipients "$TO_JSON" \
+        --arg subject "$SUBJECT" \
+        --rawfile html "$OUTPUT_HTML" \
+        '
+        {
+          FromEmailAddress: $from,
+          Destination: {
+            ToAddresses: $recipients
+          },
+          Content: {
+            Simple: {
+              Subject: {
+                Data: $subject,
+                Charset: "UTF-8"
+              },
+              Body: {
+                Html: {
+                  Data: $html,
+                  Charset: "UTF-8"
+                }
+              }
+            }
+          }
+        }
+        ' > "$SES_JSON"
+
+
+    echo "Sending report using Amazon SES..."
+
+    aws sesv2 send-email \
+        --region "$SES_REGION" \
+        --cli-input-json "file://$SES_JSON"
+
+
+    echo ""
+    echo "Email successfully submitted to SES."
+
+fi
+
+
+# ============================================================
+# CLEAN TEMP SES FILE
+# ============================================================
+
+rm -f "$SES_JSON"
+
+
+echo ""
+echo "Done."
