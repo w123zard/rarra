@@ -3,21 +3,48 @@
 set -euo pipefail
 
 FILTER_KEYWORD="timebound"
+
 SES_REGION="us-east-1"
-FROM_EMAIL="aws-reports@yourcompany.com"
-TO_EMAILS="user1@yourcompany.com,user2@yourcompany.com"
+FROM_EMAIL="your-verified-email@xxx.org"
+TO_EMAILS="recipient1@xxx.org,recipient2@xxx.org"
 SEND_EMAIL="true"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
 OUTPUT_CSV="timebound_groups_${TIMESTAMP}.csv"
 OUTPUT_HTML="timebound_groups_${TIMESTAMP}.html"
-SES_JSON="ses_message_${TIMESTAMP}.json"
+SES_JSON="/tmp/ses_message_${TIMESTAMP}.json"
+
+PROD_HTML_TMP="/tmp/timebound_prod_${TIMESTAMP}.html"
+NONPROD_HTML_TMP="/tmp/timebound_nonprod_${TIMESTAMP}.html"
+PROD_CSV_TMP="/tmp/timebound_prod_${TIMESTAMP}.csv"
+NONPROD_CSV_TMP="/tmp/timebound_nonprod_${TIMESTAMP}.csv"
+
 SUBJECT="AWS Timebound Access Report - $(date '+%Y-%m-%d')"
 
 html_escape() {
     printf '%s' "$1" | jq -Rr '@html'
 }
+
+cleanup() {
+    rm -f "$SES_JSON" \
+          "$PROD_HTML_TMP" \
+          "$NONPROD_HTML_TMP" \
+          "$PROD_CSV_TMP" \
+          "$NONPROD_CSV_TMP"
+}
+
+trap cleanup EXIT
+
+> "$PROD_HTML_TMP"
+> "$NONPROD_HTML_TMP"
+> "$PROD_CSV_TMP"
+> "$NONPROD_CSV_TMP"
+
+PROD_GROUP_COUNT=0
+NONPROD_GROUP_COUNT=0
+TOTAL_USERS=0
 
 echo "Fetching IAM Identity Center instance..."
 
@@ -39,7 +66,9 @@ ALL_GROUPS_JSON=$(aws identitystore list-groups \
 
 MATCHED_GROUPS=$(echo "$ALL_GROUPS_JSON" | jq -r \
     --arg kw "$FILTER_KEYWORD" \
-    '.Groups[] | select(.DisplayName | ascii_downcase | contains($kw | ascii_downcase)) | "\(.GroupId)|\(.DisplayName)"' \
+    '.Groups[]
+     | select(.DisplayName | ascii_downcase | contains($kw | ascii_downcase))
+     | "\(.GroupId)|\(.DisplayName)"' \
     | sort -t'|' -k2)
 
 if [[ -z "$MATCHED_GROUPS" ]]; then
@@ -49,83 +78,13 @@ fi
 
 MATCH_COUNT=$(echo "$MATCHED_GROUPS" | wc -l | tr -d ' ')
 
-echo "Found $MATCH_COUNT timebound group(s)."
+echo "Found $MATCH_COUNT group(s) containing '$FILTER_KEYWORD'."
+echo ""
 
-echo "GroupName,Member Count,Members" > "$OUTPUT_CSV"
-
-cat > "$OUTPUT_HTML" <<EOF
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-body {
-    font-family: Arial, Helvetica, sans-serif;
-    font-size: 14px;
-    color: #333333;
-}
-h2 {
-    color: #232f3e;
-}
-.summary {
-    background-color: #f3f4f6;
-    padding: 12px;
-    margin-bottom: 20px;
-    border-left: 5px solid #ff9900;
-}
-table {
-    border-collapse: collapse;
-    width: 100%;
-}
-th {
-    background-color: #232f3e;
-    color: white;
-    text-align: left;
-    padding: 10px;
-}
-td {
-    border: 1px solid #dddddd;
-    padding: 10px;
-    vertical-align: top;
-}
-tr:nth-child(even) {
-    background-color: #f7f7f7;
-}
-.member-count {
-    text-align: center;
-    font-weight: bold;
-}
-ul {
-    margin: 0;
-    padding-left: 20px;
-}
-.footer {
-    margin-top: 20px;
-    font-size: 12px;
-    color: #777777;
-}
-</style>
-</head>
-<body>
-<h2>AWS IAM Identity Center - Timebound Access Report</h2>
-
-<div class="summary">
-<b>Report generated:</b> $REPORT_DATE<br>
-<b>Filter:</b> $FILTER_KEYWORD<br>
-<b>Total timebound groups:</b> $MATCH_COUNT
-</div>
-
-<table>
-<tr>
-<th>Timebound Group</th>
-<th>Member Count</th>
-<th>Members</th>
-</tr>
-EOF
-
-TOTAL_USERS=0
+echo "Environment,GroupName,Member Count,Members" > "$OUTPUT_CSV"
 
 while IFS='|' read -r GROUP_ID GROUP_NAME; do
+
     echo "Processing: $GROUP_NAME"
 
     MEMBER_IDS=$(aws identitystore list-group-memberships \
@@ -139,9 +98,11 @@ while IFS='|' read -r GROUP_ID GROUP_NAME; do
     MEMBER_COUNT=0
 
     if [[ -n "$MEMBER_IDS" ]]; then
+
         MEMBERS_HTML="<ul>"
 
         for USER_ID in $MEMBER_IDS; do
+
             USER_INFO=$(aws identitystore describe-user \
                 --identity-store-id "$IDENTITY_STORE_ID" \
                 --user-id "$USER_ID" \
@@ -169,22 +130,43 @@ while IFS='|' read -r GROUP_ID GROUP_NAME; do
             MEMBERS_HTML="${MEMBERS_HTML}<li>${DISPLAY_NAME_HTML} &lt;${EMAIL_HTML}&gt;</li>"
 
             MEMBER_COUNT=$((MEMBER_COUNT + 1))
-            TOTAL_USERS=$((TOTAL_USERS + 1))
         done
 
         MEMBERS_HTML="${MEMBERS_HTML}</ul>"
+    fi
+
+    if [[ $MEMBER_COUNT -eq 0 ]]; then
+        echo "Skipping empty group: $GROUP_NAME"
+        continue
+    fi
+
+    TOTAL_USERS=$((TOTAL_USERS + MEMBER_COUNT))
+
+    GROUP_NAME_LOWER=$(echo "$GROUP_NAME" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$GROUP_NAME_LOWER" == *"prod"* &&
+          "$GROUP_NAME_LOWER" != *"nonprod"* &&
+          "$GROUP_NAME_LOWER" != *"non-prod"* ]]; then
+
+        ENVIRONMENT="PROD"
+        PROD_GROUP_COUNT=$((PROD_GROUP_COUNT + 1))
+
     else
-        MEMBERS_STR="(No members)"
-        MEMBERS_HTML="<i>No members</i>"
+
+        ENVIRONMENT="NON-PROD"
+        NONPROD_GROUP_COUNT=$((NONPROD_GROUP_COUNT + 1))
+
     fi
 
     MEMBERS_STR_ESC="${MEMBERS_STR//\"/\"\"}"
-
-    echo "\"${GROUP_NAME}\",${MEMBER_COUNT},\"${MEMBERS_STR_ESC}\"" >> "$OUTPUT_CSV"
-
     GROUP_NAME_HTML=$(html_escape "$GROUP_NAME")
 
-    cat >> "$OUTPUT_HTML" <<EOF
+    if [[ "$ENVIRONMENT" == "PROD" ]]; then
+
+        echo "\"PROD\",\"${GROUP_NAME}\",${MEMBER_COUNT},\"${MEMBERS_STR_ESC}\"" \
+            >> "$PROD_CSV_TMP"
+
+        cat >> "$PROD_HTML_TMP" <<EOF
 <tr>
 <td><b>${GROUP_NAME_HTML}</b></td>
 <td class="member-count">${MEMBER_COUNT}</td>
@@ -192,15 +174,163 @@ while IFS='|' read -r GROUP_ID GROUP_NAME; do
 </tr>
 EOF
 
+    else
+
+        echo "\"NON-PROD\",\"${GROUP_NAME}\",${MEMBER_COUNT},\"${MEMBERS_STR_ESC}\"" \
+            >> "$NONPROD_CSV_TMP"
+
+        cat >> "$NONPROD_HTML_TMP" <<EOF
+<tr>
+<td><b>${GROUP_NAME_HTML}</b></td>
+<td class="member-count">${MEMBER_COUNT}</td>
+<td>${MEMBERS_HTML}</td>
+</tr>
+EOF
+
+    fi
+
 done <<< "$MATCHED_GROUPS"
+
+cat "$PROD_CSV_TMP" >> "$OUTPUT_CSV"
+cat "$NONPROD_CSV_TMP" >> "$OUTPUT_CSV"
+
+ACTIVE_GROUP_COUNT=$((PROD_GROUP_COUNT + NONPROD_GROUP_COUNT))
+
+cat > "$OUTPUT_HTML" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+
+<style>
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 14px;
+    color: #333333;
+    margin: 25px;
+}
+
+h2 {
+    color: #232f3e;
+}
+
+h3 {
+    margin-top: 28px;
+    color: #232f3e;
+}
+
+.summary {
+    background-color: #f3f4f6;
+    padding: 12px;
+    margin-bottom: 20px;
+    border-left: 5px solid #ff9900;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 25px;
+}
+
+th {
+    background-color: #232f3e;
+    color: white;
+    text-align: left;
+    padding: 10px;
+}
+
+td {
+    border: 1px solid #dddddd;
+    padding: 10px;
+    vertical-align: top;
+}
+
+tr:nth-child(even) {
+    background-color: #f7f7f7;
+}
+
+.member-count {
+    text-align: center;
+    font-weight: bold;
+    width: 120px;
+}
+
+ul {
+    margin: 0;
+    padding-left: 20px;
+}
+
+.footer {
+    margin-top: 20px;
+    font-size: 12px;
+    color: #777777;
+}
+</style>
+
+</head>
+
+<body>
+
+<h2>AWS IAM Identity Center - Timebound Access Report</h2>
+
+<div class="summary">
+<b>Report generated:</b> $REPORT_DATE<br>
+<b>Filter:</b> $FILTER_KEYWORD<br>
+<b>Production groups with members:</b> $PROD_GROUP_COUNT<br>
+<b>Non-production groups with members:</b> $NONPROD_GROUP_COUNT<br>
+<b>Total active timebound groups:</b> $ACTIVE_GROUP_COUNT<br>
+<b>Total group memberships:</b> $TOTAL_USERS
+</div>
+
+<h3>Production</h3>
+
+<table>
+<tr>
+<th>Timebound Group</th>
+<th>Member Count</th>
+<th>Members</th>
+</tr>
+EOF
+
+if [[ $PROD_GROUP_COUNT -gt 0 ]]; then
+    cat "$PROD_HTML_TMP" >> "$OUTPUT_HTML"
+else
+    cat >> "$OUTPUT_HTML" <<EOF
+<tr>
+<td colspan="3"><i>No production timebound groups with members.</i></td>
+</tr>
+EOF
+fi
+
+cat >> "$OUTPUT_HTML" <<EOF
+</table>
+
+<h3>Non-Production</h3>
+
+<table>
+<tr>
+<th>Timebound Group</th>
+<th>Member Count</th>
+<th>Members</th>
+</tr>
+EOF
+
+if [[ $NONPROD_GROUP_COUNT -gt 0 ]]; then
+    cat "$NONPROD_HTML_TMP" >> "$OUTPUT_HTML"
+else
+    cat >> "$OUTPUT_HTML" <<EOF
+<tr>
+<td colspan="3"><i>No non-production timebound groups with members.</i></td>
+</tr>
+EOF
+fi
 
 cat >> "$OUTPUT_HTML" <<EOF
 </table>
 
 <div class="footer">
-Total groups: $MATCH_COUNT<br>
-Total group memberships: $TOTAL_USERS<br><br>
-Generated automatically from AWS IAM Identity Center.
+Generated automatically from AWS IAM Identity Center.<br>
+Groups without members are excluded from this report.
 </div>
 
 </body>
@@ -208,16 +338,24 @@ Generated automatically from AWS IAM Identity Center.
 EOF
 
 echo ""
+echo "-------------------------------------------------------------"
 echo "Report generation completed."
-echo "CSV : $OUTPUT_CSV"
-echo "HTML: $OUTPUT_HTML"
-echo "Groups processed : $MATCH_COUNT"
-echo "Memberships : $TOTAL_USERS"
+echo "CSV  : $OUTPUT_CSV"
+echo "HTML : $OUTPUT_HTML"
+echo ""
+echo "Matching groups found        : $MATCH_COUNT"
+echo "Production groups reported   : $PROD_GROUP_COUNT"
+echo "Non-production groups reported: $NONPROD_GROUP_COUNT"
+echo "Empty groups excluded        : $((MATCH_COUNT - ACTIVE_GROUP_COUNT))"
+echo "Total group memberships      : $TOTAL_USERS"
+echo "-------------------------------------------------------------"
 
 if [[ "$SEND_EMAIL" == "true" ]]; then
+
+    echo ""
     echo "Preparing email..."
 
-    TO_JSON=$(echo "$TO_EMAILS" | jq -Rc 'split(",")')
+    TO_JSON=$(echo "$TO_EMAILS" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$";""))')
 
     jq -n \
         --arg from "$FROM_EMAIL" \
@@ -251,9 +389,8 @@ if [[ "$SEND_EMAIL" == "true" ]]; then
         --region "$SES_REGION" \
         --cli-input-json "file://$SES_JSON"
 
-    echo "Email submitted to SES."
+    echo "Email submitted successfully to SES."
 fi
 
-rm -f "$SES_JSON"
-
+echo ""
 echo "Done."
